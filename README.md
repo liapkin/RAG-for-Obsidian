@@ -16,6 +16,7 @@ ln -s /path/to/your/vault vault
 python rag.py index          # chunk + embed the vault (markdown, split on ## headings)
 python rag.py "how do I restore a database?"
 python rag.py chat           # interactive REPL with conversation history
+python rag.py serve          # web UI at localhost:8000, rendered markdown + streaming
 python rag.py selftest       # sanity-check chunking + retrieval
 ```
 

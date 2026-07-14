@@ -8,6 +8,7 @@ Usage:
     python rag.py index         # (re)build the index from the vault
     python rag.py "question"    # ask one question
     python rag.py chat          # interactive REPL with conversation history
+    python rag.py serve [port]  # web UI with rendered markdown (default :8000)
     python rag.py selftest      # sanity-check chunking + retrieval
 """
 import json
@@ -127,33 +128,30 @@ def retrieve(question: str, vecs: np.ndarray, chunks: list[dict]) -> list[int]:
     return sorted(rrf, key=rrf.get, reverse=True)[:TOP_K]
 
 
-def ask_deepseek(messages: list[dict]) -> str:
-    """Stream the answer to stdout, return the full text."""
+def stream_deepseek(messages: list[dict]):
+    """Yield answer deltas; API errors are yielded as text so every caller shows them."""
     key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
-        sys.exit("DEEPSEEK_API_KEY not set")
+        yield "**DEEPSEEK_API_KEY not set** — put it in .env"
+        return
     req = urllib.request.Request(
         "https://api.deepseek.com/chat/completions",
         data=json.dumps({"model": "deepseek-chat", "messages": messages, "stream": True}).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
     )
-    parts = []
     try:
         with urllib.request.urlopen(req) as resp:
             for line in resp:
                 line = line.decode().strip()
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
-                delta = json.loads(line[6:])["choices"][0]["delta"].get("content", "")
-                parts.append(delta)
-                print(delta, end="", flush=True)
+                yield json.loads(line[6:])["choices"][0]["delta"].get("content", "")
     except urllib.error.HTTPError as e:
-        sys.exit(f"DeepSeek API error {e.code}: {e.read().decode(errors='replace')}")
-    print()
-    return "".join(parts)
+        yield f"**DeepSeek API error {e.code}**: {e.read().decode(errors='replace')}"
 
 
-def query(question: str, history: list[dict] | None = None) -> list[dict]:
+def build_query(question: str, history: list[dict] | None) -> tuple[list[dict], list[str]]:
+    """Retrieve context and build the message list. Returns (messages, source labels)."""
     if not INDEX_NPZ.exists():
         sys.exit("no index — run: python rag.py index")
     vecs = np.load(INDEX_NPZ)["vecs"]
@@ -171,14 +169,22 @@ def query(question: str, history: list[dict] | None = None) -> list[dict]:
     }
     prompt = f"Notes:\n{context}\n\nQuestion: {question}"
     messages = [system] + (history or []) + [{"role": "user", "content": prompt}]
-    answer = ask_deepseek(messages)
-    print("\nSources:")
-    for i in top:
-        print(f"  {chunks[i]['file']}#{chunks[i]['heading']}")
+    return messages, [f"{chunks[i]['file']}#{chunks[i]['heading']}" for i in top]
+
+
+def query(question: str, history: list[dict] | None = None) -> list[dict]:
+    messages, sources = build_query(question, history)
+    parts = []
+    for delta in stream_deepseek(messages):
+        parts.append(delta)
+        print(delta, end="", flush=True)
+    print("\n\nSources:")
+    for s in sources:
+        print(f"  {s}")
     # keep history lean: store the bare question, not the injected notes
     return (history or []) + [
         {"role": "user", "content": question},
-        {"role": "assistant", "content": answer},
+        {"role": "assistant", "content": "".join(parts)},
     ]
 
 
@@ -194,6 +200,81 @@ def chat():
             break
         if question:
             history = query(question, history)
+
+
+PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Obsidian RAG</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+body{font:16px/1.5 system-ui;max-width:760px;margin:0 auto;padding:1rem;background:#1e1e2e;color:#cdd6f4}
+.q{background:#313244;border-radius:12px;padding:.6rem 1rem;margin:1rem 0 .5rem;white-space:pre-wrap}
+.a{padding:0 .2rem}
+.a pre{background:#11111b;padding:.7rem;border-radius:8px;overflow-x:auto}
+.a code{background:#11111b;padding:.1rem .3rem;border-radius:4px}
+form{display:flex;gap:.5rem;position:sticky;bottom:0;background:#1e1e2e;padding:.8rem 0}
+input{flex:1;font:inherit;padding:.6rem 1rem;border-radius:12px;border:1px solid #45475a;background:#313244;color:inherit}
+button{font:inherit;padding:.6rem 1.2rem;border-radius:12px;border:0;background:#89b4fa;color:#11111b;cursor:pointer}
+button:disabled{opacity:.5}
+</style>
+<h3>Obsidian RAG</h3><div id=log></div>
+<form id=f><input id=i placeholder="ask your notes…" autofocus autocomplete=off><button id=b>ask</button></form>
+<script>
+const history = [];
+f.onsubmit = async e => {
+  e.preventDefault();
+  const question = i.value.trim();
+  if (!question) return;
+  i.value = ''; b.disabled = true;
+  const q = document.createElement('div'); q.className = 'q'; q.textContent = question;
+  const a = document.createElement('div'); a.className = 'a';
+  log.append(q, a);
+  try {
+    const res = await fetch('/ask', {method: 'POST', body: JSON.stringify({question, history})});
+    const rd = res.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {done, value} = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      a.innerHTML = marked.parse(buf);  // ponytail: own notes, local page — DOMPurify if ever exposed
+      scrollTo(0, document.body.scrollHeight);
+    }
+    history.push({role: 'user', content: question}, {role: 'assistant', content: buf});
+  } catch (err) { a.textContent = 'error: ' + err; }
+  b.disabled = false; i.focus();
+};
+</script>"""
+
+
+def serve(port=8000):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            messages, sources = build_query(data["question"], data.get("history"))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Connection", "close")  # no content-length: stream until close
+            self.end_headers()
+            for delta in stream_deepseek(messages):
+                self.wfile.write(delta.encode())
+                self.wfile.flush()
+            self.wfile.write(("\n\n**Sources**\n" + "\n".join(f"- {s}" for s in sources)).encode())
+
+        def log_message(self, *a):
+            pass
+
+    print(f"serving on http://localhost:{port}")
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
 def selftest():
@@ -225,6 +306,8 @@ if __name__ == "__main__":
         build_index()
     elif args[0] == "chat":
         chat()
+    elif args[0] == "serve":
+        serve(int(args[1]) if len(args) > 1 else 8000)
     elif args[0] == "selftest":
         selftest()
     else:
