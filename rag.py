@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """RAG over an Obsidian vault: local embeddings (fastembed) + DeepSeek for answers.
 
+Retrieval is hybrid: dense (embeddings, cosine) + sparse (BM25) fused with
+reciprocal rank fusion. Answers stream from DeepSeek.
+
 Usage:
     python rag.py index         # (re)build the index from the vault
-    python rag.py "question"    # ask a question
+    python rag.py "question"    # ask one question
+    python rag.py chat          # interactive REPL with conversation history
     python rag.py selftest      # sanity-check chunking + retrieval
 """
 import json
+import math
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -83,43 +89,111 @@ def build_index():
     print(f"indexed {len(chunks)} chunks from {len(set(c['file'] for c in chunks))} files")
 
 
-def ask_deepseek(prompt: str) -> str:
+def tokenize(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+def bm25_rank(question: str, chunks: list[dict], k1=1.5, b=0.75) -> np.ndarray:
+    """Chunk indices ranked by BM25, best first.
+
+    ponytail: recomputed per query, fine at hundreds of chunks — precompute at index time if slow.
+    """
+    docs = [tokenize(c["text"]) for c in chunks]
+    avgdl = sum(map(len, docs)) / len(docs)
+    df: dict[str, int] = {}
+    for d in docs:
+        for t in set(d):
+            df[t] = df.get(t, 0) + 1
+    n = len(docs)
+    scores = np.zeros(n)
+    for t in tokenize(question):
+        if t not in df:
+            continue
+        idf = math.log((n - df[t] + 0.5) / (df[t] + 0.5) + 1)
+        for i, d in enumerate(docs):
+            tf = d.count(t)
+            scores[i] += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len(d) / avgdl))
+    return np.argsort(scores)[::-1]
+
+
+def retrieve(question: str, vecs: np.ndarray, chunks: list[dict]) -> list[int]:
+    """Hybrid retrieval: dense + BM25 rankings fused with reciprocal rank fusion."""
+    dense = np.argsort(vecs @ embed([question])[0])[::-1]
+    sparse = bm25_rank(question, chunks)
+    rrf: dict[int, float] = {}
+    for ranking in (dense, sparse):
+        for rank, i in enumerate(ranking):
+            rrf[int(i)] = rrf.get(int(i), 0) + 1 / (60 + rank)
+    return sorted(rrf, key=rrf.get, reverse=True)[:TOP_K]
+
+
+def ask_deepseek(messages: list[dict]) -> str:
+    """Stream the answer to stdout, return the full text."""
     key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
         sys.exit("DEEPSEEK_API_KEY not set")
     req = urllib.request.Request(
         "https://api.deepseek.com/chat/completions",
-        data=json.dumps({
-            "model": "deepseek-chat",
-            "messages": [{"role": "user", "content": prompt}],
-        }).encode(),
+        data=json.dumps({"model": "deepseek-chat", "messages": messages, "stream": True}).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
     )
+    parts = []
     try:
         with urllib.request.urlopen(req) as resp:
-            return json.load(resp)["choices"][0]["message"]["content"]
+            for line in resp:
+                line = line.decode().strip()
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                delta = json.loads(line[6:])["choices"][0]["delta"].get("content", "")
+                parts.append(delta)
+                print(delta, end="", flush=True)
     except urllib.error.HTTPError as e:
         sys.exit(f"DeepSeek API error {e.code}: {e.read().decode(errors='replace')}")
+    print()
+    return "".join(parts)
 
 
-def query(question: str):
+def query(question: str, history: list[dict] | None = None) -> list[dict]:
     if not INDEX_NPZ.exists():
         sys.exit("no index — run: python rag.py index")
     vecs = np.load(INDEX_NPZ)["vecs"]
     chunks = json.loads(INDEX_JSON.read_text())
-    qvec = embed([question])[0]
-    top = np.argsort(vecs @ qvec)[::-1][:TOP_K]
+    top = retrieve(question, vecs, chunks)
     context = "\n\n---\n\n".join(
         f"[{chunks[i]['file']}#{chunks[i]['heading']}]\n{chunks[i]['text']}" for i in top
     )
-    prompt = (
-        "Answer the question using only the notes below. Cite the [file#heading] you used. "
-        f"If the notes don't cover it, say so.\n\nNotes:\n{context}\n\nQuestion: {question}"
-    )
-    print(ask_deepseek(prompt))
+    system = {
+        "role": "system",
+        "content": "Answer from the retrieved notes and the conversation history — nothing else. "
+        "Your own previous answers are a fully valid source: for follow-ups, ignore the freshly "
+        "retrieved notes if the conversation already holds the answer. Cite the [file#heading] "
+        "you used. If nothing covers it, say so.",
+    }
+    prompt = f"Notes:\n{context}\n\nQuestion: {question}"
+    messages = [system] + (history or []) + [{"role": "user", "content": prompt}]
+    answer = ask_deepseek(messages)
     print("\nSources:")
     for i in top:
         print(f"  {chunks[i]['file']}#{chunks[i]['heading']}")
+    # keep history lean: store the bare question, not the injected notes
+    return (history or []) + [
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": answer},
+    ]
+
+
+def chat():
+    # ponytail: retrieval sees only the bare follow-up ("how do I drop it?"), not the
+    # conversation — upgrade path: rewrite the query with history via one extra LLM call.
+    history: list[dict] = []
+    print("obsidian rag — ask away (ctrl-d to quit)")
+    while True:
+        try:
+            question = input("\n> ").strip()
+        except EOFError:
+            break
+        if question:
+            history = query(question, history)
 
 
 def selftest():
@@ -133,9 +207,13 @@ def selftest():
     assert [c["heading"] for c in cs] == [p.stem, "Alpha", "Beta", "Beta"], cs
     assert "alpha body" in cs[1]["text"]
 
-    vecs = embed(["the capital of France is Paris", "how to bake sourdough bread"])
+    toy = [{"text": "the capital of France is Paris"}, {"text": "how to bake sourdough bread"}]
+    assert int(bm25_rank("sourdough bread recipe", toy)[0]) == 1
+
+    vecs = embed([c["text"] for c in toy])
     q = embed(["french capital city"])[0]
     assert int(np.argmax(vecs @ q)) == 0
+    assert retrieve("bake sourdough", vecs, toy)[0] == 1  # hybrid agrees when both signals do
     print("selftest ok")
 
 
@@ -145,6 +223,8 @@ if __name__ == "__main__":
         sys.exit(__doc__)
     if args[0] == "index":
         build_index()
+    elif args[0] == "chat":
+        chat()
     elif args[0] == "selftest":
         selftest()
     else:
