@@ -1,0 +1,15 @@
+# one service: the backend serves the frontend page itself
+services:
+  rag:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      VAULT: /app/vault
+    volumes:
+      - ${VAULT_DIR:-../obsidian}:/app/vault:ro
+      - hf-cache:/root/.cache  # embedding model survives rebuilds
+volumes:
+  hf-cache:

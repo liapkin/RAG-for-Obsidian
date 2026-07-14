@@ -1,0 +1,63 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Obsidian RAG</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+body{font:16px/1.5 system-ui;max-width:760px;margin:0 auto;padding:1rem;background:#1e1e2e;color:#cdd6f4}
+.q{background:#313244;border-radius:12px;padding:.6rem 1rem;margin:1rem 0 .5rem;white-space:pre-wrap}
+.a{padding:0 .2rem}
+.a pre{background:#11111b;padding:.7rem;border-radius:8px;overflow-x:auto}
+.a code{background:#11111b;padding:.1rem .3rem;border-radius:4px}
+.a details{margin-top:.5rem;color:#7f849c;font-size:.85rem}
+.a summary{cursor:pointer}
+form{display:flex;gap:.5rem;position:sticky;bottom:0;background:#1e1e2e;padding:.8rem 0}
+input{flex:1;font:inherit;padding:.6rem 1rem;border-radius:12px;border:1px solid #45475a;background:#313244;color:inherit}
+button{font:inherit;padding:.6rem 1.2rem;border-radius:12px;border:0;background:#89b4fa;color:#11111b;cursor:pointer}
+button:disabled{opacity:.5}
+</style>
+<h3>Obsidian RAG</h3><div id=log></div>
+<form id=f><input id=i placeholder="ask your notes…" autofocus autocomplete=off><button id=b>ask</button>
+<button type=button onclick="localStorage.removeItem('ragHistory');location.reload()">clear</button></form>
+<script>
+const history = JSON.parse(localStorage.ragHistory || '[]');
+let ctrl = null;
+
+function bubble(role, content) {
+  const d = document.createElement('div');
+  d.className = role === 'user' ? 'q' : 'a';
+  if (role === 'user') d.textContent = content;
+  else d.innerHTML = marked.parse(content);  // own notes, local page — DOMPurify if ever exposed
+  log.append(d);
+  return d;
+}
+for (const m of history) bubble(m.role, m.content);
+scrollTo(0, document.body.scrollHeight);
+
+f.onsubmit = async e => {
+  e.preventDefault();
+  if (ctrl) { ctrl.abort(); return; }  // button doubles as stop
+  const question = i.value.trim();
+  if (!question) return;
+  i.value = ''; b.textContent = 'stop';
+  ctrl = new AbortController();
+  bubble('user', question);
+  const a = bubble('assistant', '…');
+  let buf = '';
+  try {
+    const res = await fetch('/ask', {method: 'POST', signal: ctrl.signal,
+                                     body: JSON.stringify({question, history: history.slice(-10)})});
+    const rd = res.body.getReader(), dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      a.innerHTML = marked.parse(buf);
+      scrollTo(0, document.body.scrollHeight);
+    }
+  } catch (err) { if (err.name !== 'AbortError') a.textContent = 'error: ' + err; }
+  if (buf) {
+    history.push({role: 'user', content: question}, {role: 'assistant', content: buf});
+    localStorage.ragHistory = JSON.stringify(history);
+  }
+  ctrl = null; b.textContent = 'ask'; i.focus();
+};
+</script>
