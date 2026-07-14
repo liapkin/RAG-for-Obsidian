@@ -150,13 +150,26 @@ def stream_deepseek(messages: list[dict]):
         yield f"**DeepSeek API error {e.code}**: {e.read().decode(errors='replace')}"
 
 
+def rewrite_query(question: str, history: list[dict]) -> str:
+    """Turn a follow-up ("how do I drop it?") into a standalone question for retrieval."""
+    msgs = history[-6:] + [{
+        "role": "user",
+        "content": "Rewrite my next question as one standalone search query, resolving any "
+        f"references to the conversation above. Reply with only the query.\n\n{question}",
+    }]
+    rewritten = "".join(stream_deepseek(msgs)).strip()
+    # stream_deepseek yields errors as **bold** text — fall back to the raw question
+    return question if not rewritten or rewritten.startswith("**") else rewritten
+
+
 def build_query(question: str, history: list[dict] | None) -> tuple[list[dict], list[str]]:
     """Retrieve context and build the message list. Returns (messages, source labels)."""
     if not INDEX_NPZ.exists():
         sys.exit("no index — run: python rag.py index")
     vecs = np.load(INDEX_NPZ)["vecs"]
     chunks = json.loads(INDEX_JSON.read_text())
-    top = retrieve(question, vecs, chunks)
+    search = rewrite_query(question, history) if history else question
+    top = retrieve(search, vecs, chunks)
     context = "\n\n---\n\n".join(
         f"[{chunks[i]['file']}#{chunks[i]['heading']}]\n{chunks[i]['text']}" for i in top
     )
@@ -189,8 +202,6 @@ def query(question: str, history: list[dict] | None = None) -> list[dict]:
 
 
 def chat():
-    # ponytail: retrieval sees only the bare follow-up ("how do I drop it?"), not the
-    # conversation — upgrade path: rewrite the query with history via one extra LLM call.
     history: list[dict] = []
     print("obsidian rag — ask away (ctrl-d to quit)")
     while True:
@@ -211,37 +222,58 @@ body{font:16px/1.5 system-ui;max-width:760px;margin:0 auto;padding:1rem;backgrou
 .a{padding:0 .2rem}
 .a pre{background:#11111b;padding:.7rem;border-radius:8px;overflow-x:auto}
 .a code{background:#11111b;padding:.1rem .3rem;border-radius:4px}
+.a details{margin-top:.5rem;color:#7f849c;font-size:.85rem}
+.a summary{cursor:pointer}
 form{display:flex;gap:.5rem;position:sticky;bottom:0;background:#1e1e2e;padding:.8rem 0}
 input{flex:1;font:inherit;padding:.6rem 1rem;border-radius:12px;border:1px solid #45475a;background:#313244;color:inherit}
 button{font:inherit;padding:.6rem 1.2rem;border-radius:12px;border:0;background:#89b4fa;color:#11111b;cursor:pointer}
 button:disabled{opacity:.5}
 </style>
 <h3>Obsidian RAG</h3><div id=log></div>
-<form id=f><input id=i placeholder="ask your notes…" autofocus autocomplete=off><button id=b>ask</button></form>
+<form id=f><input id=i placeholder="ask your notes…" autofocus autocomplete=off><button id=b>ask</button>
+<button type=button onclick="localStorage.removeItem('ragHistory');location.reload()">clear</button></form>
 <script>
-const history = [];
+const history = JSON.parse(localStorage.ragHistory || '[]');
+let ctrl = null;
+
+function bubble(role, content) {
+  const d = document.createElement('div');
+  d.className = role === 'user' ? 'q' : 'a';
+  if (role === 'user') d.textContent = content;
+  else d.innerHTML = marked.parse(content);  // ponytail: own notes, local page — DOMPurify if ever exposed
+  log.append(d);
+  return d;
+}
+for (const m of history) bubble(m.role, m.content);
+scrollTo(0, document.body.scrollHeight);
+
 f.onsubmit = async e => {
   e.preventDefault();
+  if (ctrl) { ctrl.abort(); return; }  // button doubles as stop
   const question = i.value.trim();
   if (!question) return;
-  i.value = ''; b.disabled = true;
-  const q = document.createElement('div'); q.className = 'q'; q.textContent = question;
-  const a = document.createElement('div'); a.className = 'a';
-  log.append(q, a);
+  i.value = ''; b.textContent = 'stop';
+  ctrl = new AbortController();
+  bubble('user', question);
+  const a = bubble('assistant', '…');
+  let buf = '';
   try {
-    const res = await fetch('/ask', {method: 'POST', body: JSON.stringify({question, history})});
+    const res = await fetch('/ask', {method: 'POST', signal: ctrl.signal,
+                                     body: JSON.stringify({question, history: history.slice(-10)})});
     const rd = res.body.getReader(), dec = new TextDecoder();
-    let buf = '';
     while (true) {
       const {done, value} = await rd.read();
       if (done) break;
       buf += dec.decode(value, {stream: true});
-      a.innerHTML = marked.parse(buf);  // ponytail: own notes, local page — DOMPurify if ever exposed
+      a.innerHTML = marked.parse(buf);
       scrollTo(0, document.body.scrollHeight);
     }
+  } catch (err) { if (err.name !== 'AbortError') a.textContent = 'error: ' + err; }
+  if (buf) {
     history.push({role: 'user', content: question}, {role: 'assistant', content: buf});
-  } catch (err) { a.textContent = 'error: ' + err; }
-  b.disabled = false; i.focus();
+    localStorage.ragHistory = JSON.stringify(history);
+  }
+  ctrl = null; b.textContent = 'ask'; i.focus();
 };
 </script>"""
 
@@ -268,7 +300,8 @@ def serve(port=8000):
             for delta in stream_deepseek(messages):
                 self.wfile.write(delta.encode())
                 self.wfile.flush()
-            self.wfile.write(("\n\n**Sources**\n" + "\n".join(f"- {s}" for s in sources)).encode())
+            src = "\n".join(f"- {s}" for s in sources)
+            self.wfile.write(f"\n\n<details><summary>Sources</summary>\n\n{src}\n\n</details>".encode())
 
         def log_message(self, *a):
             pass
