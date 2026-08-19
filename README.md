@@ -48,8 +48,8 @@ rag/
 
 1. **Chunk**: each `.md` split on `## ` headings; oversized sections split on blank lines (~1500 chars).
 2. **Embed**: chunks embedded locally, normalized, stored in `index.npz` + `index.json`.
-3. **Retrieve**: hybrid — dense (cosine = one numpy dot product) + sparse (BM25, ~20 lines) rankings fused with reciprocal rank fusion. Vectors catch paraphrases, BM25 catches exact terms (error codes, CLI flags).
+3. **Retrieve**: hybrid - dense (cosine = one numpy dot product) + sparse (BM25, ~20 lines) rankings fused with reciprocal rank fusion. Vectors catch paraphrases, BM25 catches exact terms (error codes, CLI flags).
 4. **Rewrite follow-ups**: in conversations, "how do I drop it?" is condensed into a standalone query with one cheap LLM call before retrieval.
 5. **Generate**: top 5 chunks + question streamed from DeepSeek with forced `[file#heading]` citations; answers "not covered" when the notes don't have it.
 
-No vector DB by design — a few hundred chunks don't need one. Past ~10k chunks: FAISS/Chroma. Better retrieval: cross-encoder reranking.
+No vector DB by design - a few hundred chunks don't need one. Past ~10k chunks: FAISS/Chroma. Better retrieval: cross-encoder reranking.
